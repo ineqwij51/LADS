@@ -1,0 +1,20 @@
+{
+  "baseline": "",
+  "-laca": "--align_mode direct",
+  "+laca": "--align_mode lagaware",
+  "pool_avg": "--pooling mean",
+  "pool_max": "--pooling max",
+  "pool_attn": "--pooling attn_mean_max",
+  "pool_attn_std": "--pooling attn_mean_max_std",
+  "attn_only": "--pooling attn",
+  "-diff": "--use_diff 0",
+  "+diff": "--use_diff 1",
+  "-gbias": "--use_gaussian_bias 0",
+  "+gbias": "--use_gaussian_bias 1",
+  "-dyn": "--use_dynamics 0",
+  "+dyn": "--use_dynamics 1",
+  "-cos": "--use_cos 0",
+  "+cos": "--use_cos 1",
+  "-lagnorm": "--use_lag_norm 0",
+  "+lagnorm": "--use_lag_norm 1"
+}
