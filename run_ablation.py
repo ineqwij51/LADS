@@ -94,7 +94,7 @@ DEFAULT_SETS = {
 }
 
 def parse_args_robust():
-    ap = argparse.ArgumentParser("Ablation Orchestrator (template-based)")
+    ap = argparse.ArgumentParser("Ablation Orchestrator")
     ap.add_argument("--main_cmd", type=str, required=True,
                     help="Command template with placeholders: {feature} {out} {seed} {lag} {extra}")
     ap.add_argument("--out_root", type=str, default="./runs_ablation")

@@ -1,31 +1,5 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-Diffusion_3_Gpt.py  (v3: viz++ / subject-split saving / dense_flow adapter)
-
-新增：
-- 可视化更丰富：
-  • lag 曲线带平滑、有效时间掩码、均值标注；
-  • 对齐热图叠加 top-1 对齐路径与窗口边界；
-  • 自相似对比保持；
-  • 新增：训练曲线（CE 与 Diff）、raw vs learned 的 2D PCA 散点对比、
-          扩散重建误差分布(ASD/TD)与单样本时间曲线。
-- 划分记录：除 indices 外，同时保存每折 Train/Val/Test 的 subject IDs（严格检查无交叉）
-  • <exp_dir>/splits_subjects.json   （全折）
-  • <fold_dir>/subjects_split.json   （该折）
-- 针对 dense_flow 的特征前端适配器：FeatureAdapter（多尺度 depthwise-temporal conv + LN + 残差）
-  • --use_adapter 1 | 0
-  • --adapter_strength {auto,light,strong}
-  • 默认：若特征名包含 "flow"，自动启用 strong；否则 light。
-
-兼容三种外部划分 JSON：
-(A) indices:  {"folds":[{"train":[…],"val":[…],"test":[…]},…]}
-(B) tv/test:  {"folds":[{"trainval_idx":[…],"test_idx":[…]},…]}  -> 内部再做一次分层切 val
-(C) subjects: {"folds":[{"train_subjects":[…],"val_subjects":[…],"test_subjects":[…]},…]} -> 自动映射索引
-
-其它核心训练逻辑沿用上一版。
-"""
-
 import os, re, json, math, time, argparse
 from dataclasses import dataclass
 from typing import Optional, List, Dict
@@ -43,7 +17,7 @@ import matplotlib.pyplot as plt
 
 # 尝试复用 Diffusion_3 的数据与可能的划分
 try:
-    import Diffusion_3 as d3
+    import Diffusion as d3
     has_d3 = True
 except Exception as _e:
     print("[WARN] Could not import Diffusion_3.py; place this script alongside it. ->", _e)
@@ -250,167 +224,6 @@ class TemporalEncoder(nn.Module):
         x = self.out_norm(x)
         return x
 
-class DTWAligner(nn.Module):
-    def __init__(self, d_model, window=12, temperature=1.0, learn_temp=0, dropout=None, **kwargs):
-        super().__init__()
-        self.window = int(max(1, window))  # used for lag normalization in _make_discrepancy
-
-    @torch.no_grad()
-    def _dtw_one(self, E_b, S_b, emask=None, smask=None):
-        device = E_b.device
-        Te, C = E_b.shape
-        Ts = S_b.shape[0]
-
-        En = F.normalize(E_b, dim=-1)
-        Sn = F.normalize(S_b, dim=-1)
-        Cmat = 1.0 - torch.clamp(Sn @ En.t(), -1.0, 1.0)
-
-        # masks
-        if smask is not None:  # (Ts,)
-            smask = smask.to(torch.bool)
-        else:
-            smask = torch.ones(Ts, dtype=torch.bool, device=device)
-        if emask is not None:  # (Te,)
-            emask = emask.to(torch.bool)
-        else:
-            emask = torch.ones(Te, dtype=torch.bool, device=device)
-
-        valid = smask[:, None] & emask[None, :]
-
-        # Sakoe–Chiba band
-        u = torch.arange(Ts, device=device)[:, None]
-        t = torch.arange(Te, device=device)[None, :]
-        band = (t - u).abs() <= self.window
-
-        # invalid positions -> +inf cost
-        big = torch.tensor(float("inf"), device=device)
-        Cmat = torch.where(valid & band, Cmat, big)
-
-        # DTW DP
-        D = torch.empty((Ts, Te), device=device)  # accumulated cost
-        D.fill_(big)
-        D[0, 0] = Cmat[0, 0]
-        # first row/col
-        for j in range(1, Te):
-            D[0, j] = Cmat[0, j] + D[0, j-1]
-        for i in range(1, Ts):
-            D[i, 0] = Cmat[i, 0] + D[i-1, 0]
-        # interior
-        for i in range(1, Ts):
-            # restrict j range to band to加速
-            jmin = max(1, i - self.window)
-            jmax = min(Te - 1, i + self.window)
-            for j in range(jmin, jmax + 1):
-                D_ij = torch.stack((D[i-1, j], D[i, j-1], D[i-1, j-1])).min()
-                D[i, j] = Cmat[i, j] + D_ij
-
-        # backtrack
-        i, j = Ts - 1, Te - 1
-        path = []
-        while True:
-            path.append((i, j))
-            if i == 0 and j == 0: break
-            # choose argmin predecessor; guard borders
-            candidates = []
-            vals = []
-            if i > 0:   candidates.append((i-1, j));   vals.append(D[i-1, j])
-            if j > 0:   candidates.append((i, j-1));   vals.append(D[i, j-1])
-            if i > 0 and j > 0:
-                candidates.append((i-1, j-1));         vals.append(D[i-1, j-1])
-            k = torch.stack(vals).argmin().item()
-            i, j = candidates[k]
-        path.reverse()
-
-        # map u -> t(u)
-        t_idx = torch.zeros(Ts, dtype=torch.long, device=device)
-        for (i, j) in path:
-            t_idx[i] = j
-
-        # one-hot attention and warp
-        attn = torch.zeros(Ts, Te, dtype=E_b.dtype, device=device)
-        attn[torch.arange(Ts, device=device), t_idx] = 1.0
-        Ew_b = attn @ E_b  # (Ts, C)
-
-        # lag in frames, clipped
-        u_idx = torch.arange(Ts, dtype=E_b.dtype, device=device)
-        lag_b = (u_idx - t_idx.to(E_b.dtype)).clamp_min(0.0)  # (Ts,)
-        return Ew_b, attn, lag_b
-
-    def forward(self, E, S, exp_mask=None, sub_mask=None):
-        # E: (B, Te, C), S: (B, Ts, C)
-        B, Te, C = E.shape
-        Ts = S.shape[1]
-        Ew_list, attn_list, lag_list = [], [], []
-        for b in range(B):
-            em = exp_mask[b] if exp_mask is not None else None
-            sm = sub_mask[b] if sub_mask is not None else None
-            Ew_b, attn_b, lag_b = self._dtw_one(E[b], S[b], em, sm)
-            Ew_list.append(Ew_b)
-            attn_list.append(attn_b)
-            lag_list.append(lag_b)
-        Ew   = torch.stack(Ew_list, dim=0)                 # (B, Ts, C)
-        attn = torch.stack(attn_list, dim=0)               # (B, Ts, Te)
-        lag  = torch.stack(lag_list,  dim=0)               # (B, Ts)
-        return Ew, attn, lag
-
-class DirectAligner(nn.Module):
-    """
-    Direct alignment via per-frame cosine similarity (no learned lag prior).
-    If lengths differ, both streams are truncated from t=0 to T=min(Ts,Te) for lag computation.
-    Ew is returned with length Ts (truncate or zero-pad E to match), and a rectangular
-    identity attention is returned for visualization.
-
-    NOTE: lag = (1 - cos) / 2 ∈ [0,1]; we set self.window = 1 to keep lag normalization
-    consistent with _make_discrepancy (which divides by self.aligner.window).
-    """
-    def __init__(self, d_model, window=12, temperature=1.0, learn_temp=0, dropout=None, **kwargs):
-        super().__init__()
-        self.d_model = d_model
-        # IMPORTANT: we expose .window for compatibility with _make_discrepancy.
-        # Since our lag is already normalized to [0,1], set window=1 to keep the same scale.
-        self.window = 1
-
-        # keep other args for interface compatibility (unused)
-        self._temperature = float(temperature)
-        self._learn_temp = int(learn_temp)
-
-    def forward(self, E, S, exp_mask=None, sub_mask=None):
-        # E: (B, Te, C), S: (B, Ts, C)
-        B, Te, C = E.shape
-        Ts = S.shape[1]
-        T  = min(Ts, Te)  # valid prefix for cosine/lag
-
-        # cosine on the valid prefix
-        En = F.normalize(E[:, :T, :], dim=-1)
-        Sn = F.normalize(S[:, :T, :], dim=-1)
-        cos = (Sn * En).sum(dim=-1).clamp(min=-1.0, max=1.0)   # (B, T)
-        # normalized dissimilarity in [0,1] as "lag"
-        lag_T = (1.0 - cos) * 0.5                               # (B, T)
-        euc_dis = (Sn - En).abs().sum(dim=-1)                        # (B, T)
-        lag_euc = euc_dis.clamp(min=0.0)
-
-        # assemble lag of length Ts (truncate semantics + zero tail for shape match)
-        if Ts == T:
-            lag = lag_T                                         # (B, Ts)
-        else:
-            tail = torch.zeros(B, Ts - T, device=E.device, dtype=E.dtype)
-            lag = torch.cat([lag_T, tail], dim=1)               # (B, Ts)
-
-        # Ew aligned to SUB length Ts: truncate or pad zeros
-        if Te >= Ts:
-            Ew = E[:, :Ts, :]
-        else:
-            pad = torch.zeros(B, Ts - Te, C, device=E.device, dtype=E.dtype)
-            Ew = torch.cat([E, pad], dim=1)                     # (B, Ts, C)
-
-        # rectangular "identity" attention for visualization (diagonal over the valid prefix)
-        attn = E.new_zeros(B, Ts, Te)                           # float tensor
-        if T > 0:
-            idx = torch.arange(T, device=E.device)
-            attn[:, idx, idx] = 1.0
-
-        return Ew, attn, lag_euc
-
 
 class LagAwareAligner(nn.Module):
     def __init__(self, d_model: int, window: int, dropout: float = 0.1, temperature: float = 1.0,
@@ -532,12 +345,8 @@ class ImitationLagAwareClassifier(nn.Module):
                                        use_adapter=use_adapter, adapter_strength=adapter_strength)
         self.sub_enc = TemporalEncoder(feature_dim, d_model, nhead, num_layers, dropout,
                                        use_adapter=use_adapter, adapter_strength=adapter_strength)
-
-        if align_mode == "lagaware":
-            self.aligner = LagAwareAligner(d_model, window=window, dropout=dropout, temperature=1.0,
-                                        use_gauss=(int(use_gaussian_bias)==1), learn_temp=learn_temp)
-        elif align_mode == "direct":
-            self.aligner = DTWAligner(d_model, window=window, dropout=dropout)
+        self.aligner = LagAwareAligner(d_model, window=window, dropout=dropout, temperature=1.0,
+                                       use_gauss=(int(use_gaussian_bias)==1), learn_temp=learn_temp)
 
         in_feats = 0
         in_feats += 4 * d_model  # S, Ew, |.|, ⊙
@@ -629,18 +438,17 @@ class ImitationLagAwareClassifier(nn.Module):
         S = self.sub_enc(sub, sub_mask)
 
         if self.align_mode == "direct":
-        #     Ew = self._direct_align(E, S)
-        #     attn = None
-        #     T_e = exp.size(1); T_s = sub.size(1)
-        #     if T_e >= T_s:
-        #         exp_t = torch.arange(T_s, device=E.device).float().view(1, T_s)
-        #     else:
-        #         exp_t = torch.cat([torch.arange(T_e, device=E.device).float(),
-        #                         torch.full((T_s - T_e,), T_e - 1, device=E.device).float()]).view(1, T_s)
-        #     exp_t = exp_t.expand(E.size(0), -1)  # (B, T_s)
-        #     u_idx = torch.arange(T_s, device=E.device).float().view(1, T_s).expand(E.size(0), -1)
-        #     lag = (u_idx - exp_t).clamp(min=0)   # (B, T_s)
-            Ew, attn, lag = self.aligner(E, S, exp_mask, sub_mask)
+            Ew = self._direct_align(E, S)
+            attn = None
+            T_e = exp.size(1); T_s = sub.size(1)
+            if T_e >= T_s:
+                exp_t = torch.arange(T_s, device=E.device).float().view(1, T_s)
+            else:
+                exp_t = torch.cat([torch.arange(T_e, device=E.device).float(),
+                                torch.full((T_s - T_e,), T_e - 1, device=E.device).float()]).view(1, T_s)
+            exp_t = exp_t.expand(E.size(0), -1)  # (B, T_s)
+            u_idx = torch.arange(T_s, device=E.device).float().view(1, T_s).expand(E.size(0), -1)
+            lag = (u_idx - exp_t).clamp(min=0)   # (B, T_s)
         else:
             Ew, attn, lag = self.aligner(E, S, exp_mask, sub_mask)
 
@@ -661,7 +469,7 @@ class ImitationLagAwareClassifier(nn.Module):
         logits = self.classifier(Z)
 
         if return_intermediates:
-            return logits, {"attn": attn, "lag": lag, "Ew": Ew, "S": S, "E": E, "H": H, "Z": Z}
+            return logits, {"attn": attn, "lag": lag, "Ew": Ew, "S": S, "E": E}
         return logits
 
 
@@ -1224,20 +1032,6 @@ def visualize_samples(model, dataset, fold_split, device, out_dir, max_per_class
 def run_combo(data_path: str, feature: str, cfg: TrainCfg, root_out: str, seed: int,
               use_d3_splits: int, splits_json: Optional[str]):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # 打印 GPU 信息以验证设备选择
-    if torch.cuda.is_available():
-        print(f"\n{'='*60}")
-        print(f"GPU 设备信息:")
-        print(f"  使用的设备: {device}")
-        print(f"  设备索引: {device.index if device.index is not None else 0}")
-        print(f"  设备名称: {torch.cuda.get_device_name(device.index if device.index is not None else 0)}")
-        print(f"  CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', '未设置')}")
-        print(f"  可用设备数量: {torch.cuda.device_count()}")
-        print(f"{'='*60}\n")
-    else:
-        print("警告: CUDA 不可用，将使用 CPU")
-    
     set_seed(seed)
 
     assert has_d3 and hasattr(d3, "AutismDataset"), "AutismDataset not found in Diffusion_3.py"
@@ -1331,6 +1125,9 @@ def run_combo(data_path: str, feature: str, cfg: TrainCfg, root_out: str, seed: 
         best_val, te_acc, te_f1 = run_fold(model, train_loader, val_loader, test_loader, device, cfg, fold_dir)
         all_res.append({"fold": i, "best_val": best_val, "test_acc": te_acc, "test_f1": te_f1})
 
+        if i == 0:
+            viz_dir = os.path.join(exp_dir, "viz")
+            visualize_samples(base_model.to(device), dataset, fold_data, device, viz_dir, max_per_class=cfg.viz_samples, subject_key=cfg.subject_key)
 
     accs = [r["test_acc"] for r in all_res]
     f1s = [r["test_f1"] for r in all_res]
@@ -1353,45 +1150,6 @@ def run_combo(data_path: str, feature: str, cfg: TrainCfg, root_out: str, seed: 
     viz_dir = os.path.join(exp_dir, "viz_class_avg")
     classwise_viz(model, dataset, test_indices, device, viz_dir,
                 asd_label=1, grid=128, curve_len=200, lag_window=cfg.lag_window)
-
-    try:
-        plot_pca_raw_vs_z(
-            model.to(device), 
-            dataset, 
-            fold_data["test"], 
-            device, 
-            os.path.join(viz_dir, "proj2d", "pca_raw_vs_z.png"),
-            asd_label=(1 if cfg.td_label==0 else 0)
-        )
-    except Exception as e:
-        print("[WARN] plot_pca_raw_vs_z failed:", e)
-
-    # Per-fold visualization
-    viz_dir = os.path.join(fold_dir, "viz")
-    try:
-        visualize_samples(base_model.to(device), dataset, fold_split, device, viz_dir, max_per_class=cfg.viz_samples, subject_key=cfg.subject_key)
-    except Exception as e:
-        print("[WARN] visualize_samples failed:", e)
-    try:
-        # Class-wise alignment curves with model alignment (LAA if enabled)
-        visualize_classwise_alignment(base_model.to(device), dataset, fold_split, device, os.path.join(viz_dir, "align_model"),
-                                    grid=128, curve_len=200, asd_label=(1 if cfg.td_label==0 else 0), lag_window=cfg.lag_window)
-    except Exception as e:
-        print("[WARN] visualize_classwise_alignment failed:", e)
-    try:
-        # Post-hoc (no-LAA) lag curves using similarity-softmax alignment
-        visualize_classwise_lag_no_laa(dataset, fold_split, os.path.join(viz_dir, "align_nolaa"),
-                                    grid=128, curve_len=200, asd_label=(1 if cfg.td_label==0 else 0),
-                                    lag_window=cfg.lag_window, temperature=0.07)
-    except Exception as e:
-        print("[WARN] visualize_classwise_lag_no_laa failed:", e)
-    try:
-        # 2D PCA comparison: raw (SUB mean) vs discrepancy (|SUB - warped EXP| mean)
-        plot_2d_projections_check(dataset, fold_split, os.path.join(viz_dir, "proj2d"),
-                                asd_label=(1 if cfg.td_label==0 else 0),
-                                lag_window=cfg.lag_window, temperature=0.07)
-    except Exception as e:
-        print("[WARN] plot_2d_projections_check failed:", e)
 
 
 def main():
@@ -1464,6 +1222,10 @@ def main():
     print("[DONE] All combos finished. Root:", args.root_out)
 
 
+if __name__ == "__main__":
+    main()
+
+
 @torch.no_grad()
 def visualize_classwise_alignment(model, dataset, fold_split, device, out_dir,
                                   grid: int = 128, curve_len: int = 200,
@@ -1530,7 +1292,7 @@ def visualize_classwise_alignment(model, dataset, fold_split, device, out_dir,
         plt.imshow(heat[cls], origin='lower', cmap='viridis', vmin=0.0, vmax=vmax, extent=(0,1,0,1), aspect='auto')
         plt.colorbar(label='avg attention density')
         u = np.linspace(0,1,200); plt.plot(u,u,'--',color='white',alpha=0.85,linewidth=1.2,label='diag (u)')
-        plt.title(f'class-averaged alignment heatmap [{cls}] )')
+        plt.title(f'class-averaged alignment heatmap [{cls}] (N={cnt[cls]})')
         plt.xlabel('EXP (normalized time)'); plt.ylabel('SUB (normalized time)')
         plt.legend(loc='upper left', framealpha=0.85); plt.tight_layout()
         plt.savefig(os.path.join(out_dir, f'class_avg_alignment_heatmap_{cls}.png'), dpi=180); plt.close()
@@ -1541,7 +1303,7 @@ def visualize_classwise_alignment(model, dataset, fold_split, device, out_dir,
             if len(curves[cls]) == 0: continue
             arr = np.stack(curves[cls], axis=0); mean = arr.mean(0); std = arr.std(0)
             plt.fill_between(x, mean-std, mean+std, color=color, alpha=0.18, linewidth=0)
-            plt.plot(x, mean, color=color, linewidth=2.0, label=f'{cls}')
+            plt.plot(x, mean, color=color, linewidth=2.0, label=f'{cls} (N={arr.shape[0]})')
         plt.xlabel('SUB (normalized time)'); plt.ylabel(ylabel); plt.title(title)
         plt.legend(loc='best'); plt.grid(alpha=0.25); plt.tight_layout()
         plt.savefig(os.path.join(out_dir, fname), dpi=180); plt.close()
@@ -1558,319 +1320,3 @@ def visualize_classwise_alignment(model, dataset, fold_split, device, out_dir,
     with open(os.path.join(out_dir, 'class_avg_alignment_stats.json'), 'w') as f:
         json.dump(stats, f, indent=2)
     return stats
-
-
-# ====== Added by patch: post-hoc (no-LAA) alignment & visuals ======
-import numpy as _np
-import torch as _torch
-import torch.nn.functional as _F
-import matplotlib.pyplot as _plt
-
-def _resample_curve(y: _np.ndarray, L: int):
-    # y shape [T], resample via linear interpolation to length L
-    if y.size == 0:
-        return _np.zeros((L,), dtype=_np.float32)
-    x_old = _np.linspace(0, 1, num=y.shape[0])
-    x_new = _np.linspace(0, 1, num=L)
-    return _np.interp(x_new, x_old, y).astype(_np.float32)
-
-@_torch.no_grad()
-def visualize_classwise_lag_no_laa(dataset, fold_split, out_dir,
-                                   grid: int = 128, curve_len: int = 200,
-                                   asd_label: int = 1, lag_window: int = 12, temperature: float = 0.07):
-    """
-    Compute class-averaged lag curves WITHOUT model/LAA.
-    Use cosine-similarity softmax within window as alignment proxy.
-    """
-    ensure_dir(out_dir)
-    # accumulators
-    cnt = {'ASD':0, 'TD':0}
-    lag_acc = {'ASD': _np.zeros((curve_len,), dtype=_np.float32),
-               'TD':  _np.zeros((curve_len,), dtype=_np.float32)}
-    lag_sq  = {'ASD': _np.zeros((curve_len,), dtype=_np.float32),
-               'TD':  _np.zeros((curve_len,), dtype=_np.float32)}
-
-    def _to_np(x):
-        if isinstance(x, _np.ndarray): return x
-        return _np.asarray(x)
-
-    def _pack_feats(sample):
-        # Expect sample['exp'], sample['sub'] to be [T, F] or dicts already stacked upstream
-        E = sample['exp']; S = sample['sub']
-        if isinstance(E, dict): 
-            # concatenate feature types along feature dim preserving time
-            # priority: 'skeleton','dense_flow','heatmap','sparse_flow'
-            order = ['skeleton','dense_flow','heatmap','sparse_flow']
-            def cat(d):
-                parts=[]
-                for k in order:
-                    if k in d and d[k] is not None:
-                        parts.append(_to_np(d[k]))
-                if len(parts)==0:
-                    # fallback first available
-                    for v in d.values():
-                        parts.append(_to_np(v)); break
-                # determine target T: prefer skeleton length; else max length among parts
-                target_T = None
-                if isinstance(d, dict) and 'skeleton' in d and d['skeleton'] is not None:
-                    target_T = _to_np(d['skeleton']).shape[0]
-                else:
-                    target_T = max(a.shape[0] for a in parts)
-                # normalize each array to target_T along time dim:
-                # - if T == target_T-1 (flows), pad one row (repeat last) to reach target_T
-                # - if T < target_T, pad by repeating last row
-                # - if T > target_T, truncate
-                mats=[]
-                for a in parts:
-                    aa = a
-                    if aa.ndim==1:
-                        aa = aa[:, None]
-                    Tcur = aa.shape[0]
-                    if Tcur == target_T - 1:
-                        # pad one row for (T-1)->T
-                        last = aa[-1:, ...]
-                        aa = _np.concatenate([aa, last], axis=0)
-                    elif Tcur < target_T:
-                        last = aa[-1:, ...]
-                        reps = target_T - Tcur
-                        aa = _np.concatenate([aa, _np.repeat(last, reps, axis=0)], axis=0)
-                    elif Tcur > target_T:
-                        aa = aa[:target_T, ...]
-                    mats.append(aa)
-                return _np.concatenate(mats, axis=1) if len(mats)>0 else None
-            E = cat(E); S = cat(S)
-        E = _to_np(E); S = _to_np(S)
-        # time align by min length
-        T = min(E.shape[0], S.shape[0])
-        return E[:T], S[:T]
-
-    def _sim_softmax_align(E: _np.ndarray, S: _np.ndarray, w: int):
-        # E,S: [T, F]
-        T = S.shape[0]; Te = E.shape[0]
-        # normalize
-        E0 = E / (_np.linalg.norm(E, axis=1, keepdims=True) + 1e-8)
-        S0 = S / (_np.linalg.norm(S, axis=1, keepdims=True) + 1e-8)
-        # sim matrix
-        sim = S0 @ E0.T  # [T, Te]
-        # window mask
-        if w is None: w = max(1, int(0.1*T))
-        mask = _np.zeros_like(sim, dtype=_np.float32)
-        for u in range(T):
-            t0 = max(0, u-w); t1 = min(Te, u+1)  # allow only past/near-concurrent frames
-            mask[u, t0:t1] = 1.0
-        # softmax over t with temperature
-        logits = sim / max(1e-6, float(temperature))
-        logits = logits + _np.log(_np.where(mask>0, 1.0, 1e-12))
-        logits -= logits.max(axis=1, keepdims=True)
-        attn = _np.exp(logits); attn *= mask
-        attn_sum = attn.sum(axis=1, keepdims=True) + 1e-12
-        attn /= attn_sum
-        # expected t and lag
-        t_idx = _np.arange(Te, dtype=_np.float32)[None,:]
-        t_exp = (attn * t_idx).sum(axis=1)  # [T]
-        lag = _np.maximum(_np.arange(T, dtype=_np.float32) - t_exp, 0.0)
-        return attn, lag, t_exp
-
-    for idx in fold_split['test']:
-        s = dataset[idx]
-        lab = int(s['label'])
-        cls = 'ASD' if lab == asd_label else 'TD'
-        E, S = _pack_feats(s)
-        if E is None or S is None: continue
-        _, lag, _ = _sim_softmax_align(E, S, lag_window if lag_window is not None else max(1,int(0.1*len(S))))
-        lag_rs = _resample_curve(lag, curve_len)
-        lag_acc[cls] += lag_rs
-        lag_sq[cls]  += lag_rs**2
-        cnt[cls] += 1
-
-    def _plot(mean_asd, std_asd, mean_td, std_td, ylabel, fname):
-        _plt.figure(figsize=(6.2,3.2))
-        xs = _np.linspace(0,1,curve_len)
-        if cnt['ASD']>0: _plt.plot(xs, mean_asd, label='ASD'); _plt.fill_between(xs, mean_asd-std_asd, mean_asd+std_asd, alpha=0.2)
-        if cnt['TD']>0:  _plt.plot(xs, mean_td,  label='TD');  _plt.fill_between(xs,  mean_td-std_td,  mean_td+std_td,  alpha=0.2)
-        _plt.xlabel('normalized time'); _plt.ylabel(ylabel); _plt.legend()
-        _plt.tight_layout(); _plt.savefig(os.path.join(out_dir, fname), dpi=180); _plt.close()
-
-    # compute means/stds
-    mean_asd = lag_acc['ASD'] / max(1, cnt['ASD'])
-    mean_td  = lag_acc['TD']  / max(1, cnt['TD'])
-    std_asd = _np.sqrt(_np.maximum(lag_sq['ASD']/max(1,cnt['ASD']) - mean_asd**2, 0))
-    std_td  = _np.sqrt(_np.maximum(lag_sq['TD'] /max(1,cnt['TD'])  - mean_td**2, 0))
-    _plot(mean_asd, std_asd, mean_td, std_td, 'lag (frames)', 'class_avg_lag_curve_nolaa.png')
-
-    # save stats (without N in legend; counts kept in json)
-    stats = {'counts': cnt, 'curve_len': curve_len}
-    with open(os.path.join(out_dir, 'class_avg_lag_stats_nolaa.json'), 'w') as f:
-        json.dump(stats, f, indent=2)
-
-@_torch.no_grad()
-def plot_2d_projections_check(dataset, fold_split, out_dir, asd_label: int = 1,
-                              lag_window: int = 12, temperature: float = 0.07):
-    """
-    Compare 2D distributions: raw SUB vs discrepancy |SUB - warped EXP| using post-hoc alignment.
-    Produces two scatter plots (PCA-2D), per fold test set, labels ASD/TD.
-    """
-    ensure_dir(out_dir)
-    X_raw, Y = [], []
-    X_disc = []
-
-    def _to_np(x): 
-        return x if isinstance(x, _np.ndarray) else _np.asarray(x)
-
-    def _merge_feats(d):
-        if not isinstance(d, dict): 
-            return _to_np(d)
-        # prioritize skeleton
-        if 'skeleton' in d: a = _to_np(d['skeleton'])
-        else:
-            # fallback: first key
-            k = next(iter(d)); a = _to_np(d[k])
-        return a
-
-    def _align_and_disc(E, S):
-        # post-hoc alignment as above
-        Te = E.shape[0]; T = S.shape[0]
-        w = lag_window if lag_window is not None else max(1,int(0.1*T))
-        # normalize
-        E0 = E / (_np.linalg.norm(E, axis=1, keepdims=True) + 1e-8)
-        S0 = S / (_np.linalg.norm(S, axis=1, keepdims=True) + 1e-8)
-        sim = S0 @ E0.T
-        mask = _np.zeros_like(sim, dtype=_np.float32)
-        for u in range(T):
-            t0 = max(0,u-w); t1 = min(Te,u+1)
-            mask[u,t0:t1]=1.0
-        logits = sim / max(1e-6,float(temperature))
-        logits = logits + _np.log(_np.where(mask>0,1.0,1e-12))
-        logits -= logits.max(axis=1, keepdims=True)
-        attn = _np.exp(logits); attn *= mask
-        attn /= (attn.sum(axis=1, keepdims=True)+1e-12)
-        t_idx = _np.arange(Te, dtype=_np.float32)[None,:]
-        t_exp = (attn*t_idx).sum(axis=1)  # [T]
-        # build warped E via attn-weighted sum
-        Ew = attn @ E  # [T,F]
-        disc = _np.abs(S - Ew)  # [T,F]
-        return disc
-
-    for idx in fold_split['test']:
-        sample = dataset[idx]
-        lab = int(sample['label'])
-        E = _merge_feats(sample['exp'])
-        S = _merge_feats(sample['sub'])
-        T = min(E.shape[0], S.shape[0])
-        E, S = E[:T], S[:T]
-        X_raw.append(S.mean(axis=0))
-        D = _align_and_disc(E, S).mean(axis=0)
-        X_disc.append(D)
-        Y.append(lab)
-
-    X_raw = _np.stack(X_raw, axis=0) if len(X_raw)>0 else _np.zeros((0,2))
-    X_disc = _np.stack(X_disc, axis=0) if len(X_disc)>0 else _np.zeros((0,2))
-    Y = _np.asarray(Y, dtype=_np.int32)
-
-    # PCA fit on concatenated to keep axes comparable
-    if X_raw.shape[0] >= 2 and X_raw.shape[1] > 2:
-        X_all = _np.concatenate([X_raw, X_disc], axis=0)
-        X_all = X_all - X_all.mean(axis=0, keepdims=True)
-        # PCA via SVD
-        U, S, Vt = _np.linalg.svd(X_all, full_matrices=False)
-        W = Vt[:2].T  # projection matrix [F,2]
-        Z_raw = (X_raw - X_all.mean(axis=0)) @ W
-        Z_disc = (X_disc - X_all.mean(axis=0)) @ W
-    else:
-        Z_raw, Z_disc = X_raw, X_disc
-
-    def _scatter(Z, name):
-        _plt.figure(figsize=(4.8,4.2))
-        mask_asd = (Y == asd_label)
-        mask_td  = ~mask_asd
-        if mask_td.sum()>0:  _plt.scatter(Z[mask_td,0],  Z[mask_td,1],  s=12, alpha=0.7, label='TD')
-        if mask_asd.sum()>0: _plt.scatter(Z[mask_asd,0], Z[mask_asd,1], s=12, alpha=0.7, label='ASD')
-        _plt.legend(); _plt.xlabel('PC1'); _plt.ylabel('PC2'); _plt.tight_layout()
-        _plt.savefig(os.path.join(out_dir, f'{name}.png'), dpi=180); _plt.close()
-
-    _scatter(Z_raw, 'pca_raw_sub')
-    _scatter(Z_disc, 'pca_discrepancy')
-
-@torch.no_grad()
-def plot_pca_raw_vs_z(model, dataset, indices, device, save_path, asd_label=1):
-    import os
-    import numpy as np
-    import matplotlib.pyplot as plt
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-
-    m = getattr(model, "cls", model).eval()
-
-    def _to_tensor(x): 
-        import torch
-        return torch.as_tensor(x, dtype=torch.float32, device=device)
-
-    raws, zs, labels = [], [], []
-    use_all = (indices is None)
-    if use_all:
-        indices = range(len(dataset))
-
-    for idx in indices:
-        s = dataset[idx]
-        exp = _to_tensor(s["exp"]).unsqueeze(0)
-        sub = _to_tensor(s["sub"]).unsqueeze(0)
-        em  = s.get("exp_mask", None)
-        sm  = s.get("sub_mask", None)
-        if em is None: 
-            import numpy as np
-            em = np.ones((exp.shape[1],), dtype=bool)
-        if sm is None: 
-            import numpy as np
-            sm = np.ones((sub.shape[1],), dtype=bool)
-        import torch
-        em = torch.as_tensor(em, device=device)[None, :]
-        sm = torch.as_tensor(sm, device=device)[None, :]
-
-        logits, inter = m(exp, sub, exp_mask=em, sub_mask=sm, return_intermediates=True)
-        S = inter["S"]       # (1, T_s, d_model)
-        Z = inter["Z"]       # (1, d_z)
-
-        raw_vec = S.mean(dim=1).squeeze(0).detach().cpu().numpy()
-        z_vec   = Z.squeeze(0).detach().cpu().numpy()
-
-        raws.append(raw_vec)
-        zs.append(z_vec)
-        labels.append(int(s["label"]))
-
-    def _pca2(X):
-        X = np.asarray(X, float)
-        if X.ndim != 2 or X.shape[0] < 2:
-            return np.zeros((X.shape[0], 2), float)
-        mu = X.mean(axis=0, keepdims=True)
-        Xc = X - mu
-        # SVD-based PCA to 2D
-        U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
-        W = Vt[:2].T
-        return Xc @ W
-
-    raw2 = _pca2(raws)
-    z2   = _pca2(zs)
-    labels = np.asarray(labels)
-
-    # 绘图
-    plt.figure(figsize=(10.0, 4.2))
-    ax1 = plt.subplot(1,2,1)
-    for cls, color, name in [(asd_label, "#D32F2F", "ASD"), (1-asd_label, "#1976D2", "TD")]:
-        msk = (labels == cls)
-        ax1.scatter(raw2[msk,0], raw2[msk,1], s=18, alpha=0.75, label=name, edgecolors="none", c=color)
-    ax1.set_title("Raw (SUB encoder mean) — PCA-2D"); ax1.set_xlabel("PC1"); ax1.set_ylabel("PC2"); 
-    ax1.grid(alpha=0.25); ax1.legend(loc="best")
-
-    ax2 = plt.subplot(1,2,2)
-    for cls, color, name in [(asd_label, "#D32F2F", "ASD"), (1-asd_label, "#1976D2", "TD")]:
-        msk = (labels == cls)
-        ax2.scatter(z2[msk,0], z2[msk,1], s=18, alpha=0.75, label=name, edgecolors="none", c=color)
-    ax2.set_title("Difference representation $\\mathbf{z}$ — PCA-2D"); ax2.set_xlabel("PC1"); ax2.set_ylabel("PC2");
-    ax2.grid(alpha=0.25); ax2.legend(loc="best")
-
-    import matplotlib as mpl
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=180)
-    plt.close()
-
-if __name__ == "__main__":
-    main()

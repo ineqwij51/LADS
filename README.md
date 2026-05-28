@@ -6,9 +6,8 @@ This folder contains the code kept for public release of the LADS paper:
 
 | File | Purpose |
 | --- | --- |
-| `Diffusion_new.py` | Main LADS training/evaluation script used by the final main and ablation runs. |
-| `Diffusion_new_patched.py` | Later patched LADS script with DTW/no-LAA visualization and regularization-related utilities. |
-| `Diffusion_3.py` | Dataset, split, and helper code imported by the LADS scripts. |
+| `Diffusion_main.py` | Main LADS training/evaluation script used by the final main and ablation runs. |
+| `Diffusion.py` | Dataset, split, and helper code imported by the LADS scripts. |
 | `classwise_viz.py` | Class-wise alignment/lag visualization helper imported by LADS scripts. |
 | `Baselines.py` | Baseline model training script for VGG-style CNN, ResNet, PatchTST, BlockGCN-style input, DIM-style model, etc. |
 | `run_ablation.py` | Ablation runner used to launch the paper ablation variants. |
@@ -64,7 +63,7 @@ Optional baseline dependencies may include `tsai` for PatchTST.
 Run from this directory:
 
 ```bash
-python Diffusion_new.py \
+python Diffusion_main.py \
   --data_path ../results/data/autism_multimodal_dataset_20250726.pkl \
   --features skeleton,dense_flow,heatmap,sparse_flow \
   --lag_windows 12 \
@@ -85,7 +84,7 @@ Example runner command:
 
 ```bash
 python run_ablation.py \
-  --main_cmd "python Diffusion_new.py --root_out {out} --features {feature} --seed {seed} --splits_json splits_subjects_template.json {extra}" \
+  --main_cmd "python Diffusion_main.py --root_out {out} --features {feature} --seed {seed} --splits_json splits_subjects_template.json {extra}" \
   --out_root ./ablation_exps \
   --features skeleton \
   --seeds 42 \
